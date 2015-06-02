@@ -179,6 +179,7 @@ sub WriteRow($$$$)
     return $fh;
 }
 
+=pod
 sub WriteRow1($$$$)
 {
     my($table_name, $arr_of_handlers_ref, $arr_of_values_ref, $row_meta) = @_;
@@ -208,14 +209,13 @@ sub WriteRow1($$$$)
 
     close($fh);
 }
+=cut
 
-
-sub Select($$;$$)
+sub Select($$;$)
 {
-    my ($self, $table_name, $conditions_href, $use_index) = @_;
+    my ($self, $table_name, $conditions_href) = @_;
 
     my $fh;
-
     if(!-f $$self{db_dir} . "/$table_name")
     {
         die "Not Existing Table";
@@ -238,12 +238,25 @@ sub Select($$;$$)
     }
     push @result, \@colnames;
 
+    my $use_index;
+    my $index_column;
+    if(defined $conditions_href)
+    {
+        foreach my $key(keys %$conditions_href)
+        {
+            if(-f $$self{db_dir}. "/$table_name" . "_" . $key . "_index" && $$conditions_href{$key}{op} eq "==")
+            {
+                $use_index = 1;
+                $index_column = $key;
+                last;
+            }
+        }
+    }
 
-    my @positions;
     if($use_index)
     {
         #TODO not like that
-        @positions = @{$self->GetIndexedPositions($table_name, "column1", $$conditions_href{column1}{val})};
+        my @positions = @{GetIndexedPositionsByValue($$conditions_href{$index_column}{val}, $$self{db_dir}. "/$table_name" . "_" . $index_column . "_index")};
 
         foreach my $position(@positions)
         {
@@ -307,7 +320,7 @@ sub Insert($$$)#TODO insert_hash may be arr_ref(bulk)
         die "Not Existing Table";
     }
     open($fh, "+<" . $$self{db_dir} . "/$table_name") or die $!;
-    flock($fh, 2);
+    
     my $arr_ref;
 
     ($fh, $arr_ref) = ReadTableMeta($fh);
@@ -323,6 +336,12 @@ sub Insert($$$)#TODO insert_hash may be arr_ref(bulk)
     foreach my $column(@columns_arr)
     {
         $$column{write}->($fh, $$insert_hash{$$column{name}});
+        if(-f $$self{db_dir}. "/$table_name" . "_" . $$column{name} . "_index")
+        {
+            my @index_arr;
+            push @index_arr, {pos => $pos, value => $$insert_hash{$$column{name}}};
+            InsertIndex(\@index_arr, $$self{db_dir}. "/$table_name" . "_" . $$column{name} . "_index");
+        }
     }
     seek($fh,$pos,0);
     $fh = WriteRowMeta($fh);
@@ -341,11 +360,9 @@ sub Update($$$;$)
         die "Not Existing Table";
     }
     open($fh, "+<", $$self{db_dir} . "/$table_name") or die $!; 
- 
-    seek($fh,0,2);
-    my $last_pos = tell($fh);    
-    seek($fh,0,0);
     
+    my $last_pos = (stat($fh))[7];
+ 
     my $arr_ref;
     ($fh, $arr_ref) = ReadTableMeta($fh);
     
@@ -383,17 +400,36 @@ sub Update($$$;$)
             $fh = WriteRowMeta($fh, {deleted => 1});
             
             my $update_row;
-
+            
+            seek($fh, 0, 2);
+            my $pos = tell($fh);
+            $fh = WriteRowMeta($fh, {busy => 1});
             for(my $i = 0; $i < $cols_count; $i++)
             {
-                #$$update_row{$columns_arr[$i]{name}}
-                push @update_arr, exists ($$update_hash{$columns_arr[$i]{name}}) ?  $$update_hash{$columns_arr[$i]{name}} : $row[$i];    
-            }
+                my $column = $columns_arr[$i];
+                
+                if(exists $$update_hash{$$column{name}})
+                {
+                    $$update_row{$$column{name}} = $$update_hash{$$column{name}};
+                }
 
-            #seek($fh, 0,2);        
-            #$fh = WriteRow($fh, \@handlers_write, \@update_arr, undef);
+                else
+                {
+                    $$update_row{$$column{name}} = $row[$i];
+                }
+
+                $$column{write}->($fh, $$update_row{$$column{name}});
+                if(-f $$self{db_dir}. "/$table_name" . "_" . $$column{name} . "_index")
+                {
+                    my @index_arr;
+                    push @index_arr, {pos => $pos, value => $$update_row{$$column{name}}};
+                    InsertIndex(\@index_arr, $$self{db_dir}. "/$table_name" . "_" . $$column{name} . "_index");
+                }
+            }
+            print "Inserted row: ", Dumper $update_row;
+            seek($fh,$pos,0);
+            $fh = WriteRowMeta($fh);
             seek($fh, $next_row_pos, 0);
-            WriteRow1($$self{db_dir} . "/$table_name", \@handlers_write, \@update_arr, undef);
         }
     }
 
@@ -402,7 +438,7 @@ sub Update($$$;$)
 
 sub DeleteRecord($$;$)
 {
-    my($self, $table_name, $conditions_hash) = @_;     
+    my($self, $table_name, $conditions_href) = @_;     
 
     my $fh;
     my $arr_ref;
@@ -424,7 +460,7 @@ sub DeleteRecord($$;$)
     {
         push @handlers, $$column{read};
     }
-
+#TODO Add indexed search
     while(tell($fh) < $last_pos)
     {
         my $row_beginning = tell($fh);
@@ -434,8 +470,7 @@ sub DeleteRecord($$;$)
         ($fh, $row_flags) = ReadRowMeta($fh);
         ($fh, $row) = ReadRow($fh, \@handlers);
 
-        my $is_valid = 1;#TODO conditions!+
-    
+        my $is_valid = CheckCondition($row, $conditions_href, \@columns_arr); 
         if($is_valid && !$$row_flags{deleted})
         {
             my $row_ending = tell($fh);
@@ -506,198 +541,160 @@ sub CreateIndex($$$)
     }
     close($fh);
     
-    @index_arr = @{IndexSort(\@index_arr)};
-
-    open($fha, ">>", $$self{db_dir} . "/$table_name". "_" . $column_name . "_index");
-    foreach my $record(@index_arr)
-    {
-        print $fha pack("i", $$record{value});
-        print $fha BigIntPack($$record{pos});
-    }    
+    InsertIndex(\@index_arr, $$self{db_dir} . "/$table_name". "_" . $column_name . "_index");
     
-    close $fha;
-}
-
-sub IndexSort($)
-{
-    my($arr_ref) = @_;
-
-    
-    my @arr = @{$arr_ref};
-
-    my @less;
-    my @more;
-    my @pivot_arr;
-
-    if(scalar @arr <= 1)
-    {
-        return \@arr;
-    }
-    else
-    {
-        my $pivot = $arr[0];
-        foreach my $i (@arr)
-        {
-            if($$i{value} < $$pivot{value})
-            {
-                push @less, $i;
-            }
-            elsif($$i{value} > $$pivot{value})
-            {
-                push @more, $i
-            }
-            else
-            {
-                push @pivot_arr, $i;
-            }
-        }
-
-        @less = @{IndexSort(\@less)};
-        @more = @{IndexSort(\@more)};
-
-        my @all = (@less, @pivot_arr, @more);
-
-        return \@all;
-    }
-}
-
-sub ReadIndex($$$)
-{
-    my ($self, $table_name, $column_name) = @_;
-    
-    my $fh;
-    open($fh, "<", $$self{db_dir} . "/$table_name" . "_" . $column_name . "_index") or die $!;
-    
-    my $last_pos = (stat($fh))[7];
-
-
-    while(tell($fh) < $last_pos)
-    {
-        my $buffer = '';
-
-        read($fh, $buffer, $Config{intsize});
-
-        my $value = unpack("i", $buffer);
-
-        read($fh, $buffer, 8);
-
-        my $position = BigIntUnpack($buffer);
-
-        print "Value: " . $value . "\n";
-        print "Position: " . $position . "\n";
-    }
-
     close $fh;
 }
 
-sub GetIndexedPositions($$$$)
+sub InsertIndex($$)
 {
-    my ($self, $table_name, $column_name, $value) = @_;
+    my ($index_arr_ref, $filename) = @_;
+    
+     #TODO ASSERT exists filename
 
     my $fh;
-    open($fh, "<", $$self{db_dir} . "/$table_name" . "_" . $column_name . "_index") or die $!;
+    my $is_first = 0;
+    if(! -f $filename)
+    { 
+        $is_first = 1;
+        open($fh, ">", $filename ) or die $!;
+        close($fh); 
+    }
+    open($fh, "+<", $filename) or die $!;
 
-    my $last_pos = (stat($fh))[7];
-    
+    foreach my $record(@{$index_arr_ref})
+    {
+        my $pos;
+        seek($fh,0,2);
+        $pos = tell($fh);
+        
+        print $fh pack("i", $$record{value});
+        print $fh BigIntPack($$record{pos});
+        print $fh BigIntPack(0); #lchild
+        print $fh BigIntPack(0); #rchild
+        
+        if(!$is_first)
+        {
+            my $child_pos = GetIndexFreeChildPos($$record{value}, $filename);
+            print "Child pos: $child_pos\n";
+            seek($fh, $child_pos,0);
+            print $fh BigIntPack($pos);
+        }
+        $is_first = 0;
+    }
+}
 
-    my $buff;
-    my $middle;
-    my $low = 0;
-    my $high = int($last_pos/12);
-    
-    my @arr;
+sub GetIndexFreeChildPos($$)
+{
+    my($value, $filename) = @_;
 
-    seek($fh, int(($low + $high)/2) * 12, 0);
+    my $fh;
+    open($fh, "<", $filename);
     
+    my $pos;
     while(1)
     {
-        $middle = int(($low + $high)/2);
+        my $node; 
+        ($fh, $node) = ReadIndexNode($fh);
         
-        read($fh, $buff, 4);
-        my $val = unpack("i", $buff);
-        read($fh, $buff, 8);
-
-        if($value == $val)
-        {   
-            print "EQ";
-            my $curr_pos = tell($fh);
-            push @arr, BigIntUnpack($buff);
-
-            while(1)#left vals(if equal)
-            {
-                print "reading LEFT\n";
-                seek($fh, -24, 1);
-                read($fh, $buff, 4);
-                my $left_val = unpack("i", $buff);
-                read($fh, $buff, 8);
-                if($left_val == $val)
-                {
-                    push @arr,  BigIntUnpack($buff);
-                }
-                else
-                {
-                    last;
-                }
-            }
-            seek($fh, $curr_pos, 0);
-
-            while(1)#right vals(if equal)
-            {
-                print "reading RIGHT\n";
-                read($fh, $buff, 4);
-                my $right_val = unpack("i", $buff);
-                read($fh, $buff, 8);
-                if($right_val == $val)
-                {
-                    push @arr,  BigIntUnpack($buff);
-                }
-                else
-                {
-                    last;
-                }
-            }
-            last;
-        }
-        elsif($val < $value)
+        if($$node{value} > $value)
         {
-            $low = $middle;
-            seek($fh, int(($high - $low)/2) * 12, 1);
+            if(!$$node{lchild})
+            {
+                return $$node{lchild_pos};
+            }
+            else
+            {
+                seek($fh, $$node{lchild}, 0);
+            }
         }
         else
         {
-            print "GT $low $middle ";
-            $high = $middle;
-            print tell $fh, " ";
-            seek($fh, -(int(($high - $low)/2) * 12 + 24), 1);
-            print tell $fh, "\n";
+            if(!$$node{rchild})
+            {
+                return $$node{rchild_pos};
+            }
+            else
+            {
+                seek($fh, $$node{rchild}, 0);
+            }
+        }
+        
+    }
+}
+
+sub GetIndexedPositionsByValue($$;$)
+{
+    my($value, $filename, $op) = @_;
+    
+    my $fh;
+    open($fh, "<", $filename) or die $!;
+
+    my @positions;
+
+    while(1)
+    {
+        my $node;
+        ($fh, $node) = ReadIndexNode($fh);
+
+        if($value < $$node{value})
+        {
+            if(!$$node{lchild})
+            {
+                return \@positions;
+            }
+            else
+            {
+                seek($fh, $$node{lchild}, 0);
+            }
+        }
+        else
+        {
+            if($$node{value} == $value)
+            {
+                push @positions, $$node{pos};
+            }
+            if(!$$node{rchild})
+            {
+                return \@positions;
+            }
+            else
+            {
+                seek($fh, $$node{rchild}, 0);
+            }
         }
     }
-    #my @arr;
-
-    #while(tell($fh) < $last_pos)
-    #{                
-    #   my $buffer = '';
-    #
-    #   read($fh, $buffer, $Config{intsize});
-    #                           
-    #   my $val = unpack("i", $buffer);
-    #                                   
-    #
-    #   read($fh, $buffer, 8);
-    #          
-    #   if($val == $value)
-    #   {        
-    #       push @arr, BigIntUnpack($buffer);
-    #   }
-    #
-    #}
-
-   close $fh;
-
-   return \@arr;
-
 }
+
+
+
+sub ReadIndexNode($)
+{
+    my ($fh) = @_;
+
+    my $node;
+    my $buffer = "";
     
+    read($fh, $buffer, $Config{intsize});
+    $$node{value} = unpack("i", $buffer);
+
+    read($fh, $buffer, 8);
+    $$node{pos} = BigIntUnpack($buffer); # Skip value pos.
+   
+    $$node{lchild_pos} = tell($fh);
+    read($fh, $buffer, 8);
+    $$node{lchild} = BigIntUnpack($buffer);
+
+    $$node{rchild_pos} = tell($fh);
+    read($fh, $buffer, 8);
+    $$node{rchild} = BigIntUnpack($buffer);
+   
+    seek($fh, -28, 1);
+    
+    return($fh, $node);
+}
+
+
 sub CheckCondition($$$)
 {
     my($row_arr_ref, $conditions_ref, $columns_arr_ref) = @_;
